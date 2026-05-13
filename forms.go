@@ -9,47 +9,72 @@ import (
 	"github.com/jaredtmartin/hound"
 )
 
-type FieldTypes string
+type RenderMethod string
 
 const (
-	TextFieldType     FieldTypes = "TextField"
-	CheckboxFieldType FieldTypes = "CheckboxField"
-	NumberFieldType   FieldTypes = "NumberField"
-	EmailFieldType    FieldTypes = "EmailField"
-	PhoneFieldType    FieldTypes = "PhoneField"
-	// TagsFieldType     FieldTypes = "TagsField"
-	RadioFieldType    FieldTypes = "RadioField"
-	TextareaFieldType FieldTypes = "TextareaField"
-	SelectFieldType   FieldTypes = "SelectField"
+	RenderByName      RenderMethod = "RenderByName"
+	RenderByFieldType RenderMethod = "RenderByFieldType"
+	RenderByDataType  RenderMethod = "RenderByDataType"
+)
+
+func (m RenderMethod) String() string {
+	return string(m)
+}
+
+type FieldTypes string
+
+func (t FieldTypes) String() string {
+	return string(t)
+}
+
+const (
+	IdFieldType       FieldTypes = "Id"
+	TextFieldType     FieldTypes = "Text"
+	HiddenFieldType   FieldTypes = "Hidden"
+	CheckboxFieldType FieldTypes = "Checkbox"
+	NumberFieldType   FieldTypes = "Number"
+	EmailFieldType    FieldTypes = "Email"
+	PhoneFieldType    FieldTypes = "Phone"
+	// TagsFieldType     FieldTypes = "Tags"
+	RadioFieldType    FieldTypes = "Radio"
+	TextareaFieldType FieldTypes = "Textarea"
+	SelectFieldType   FieldTypes = "Select"
 )
 
 type Model struct {
-	hound.Model    `bson:",inline"`
-	fieldRenderers map[string]FieldRenderer
-	// DefaultTextField     FieldRenderer
-	// DefaultTextareaField FieldRenderer
-	// DefaultNumberField   FieldRenderer
-	// DefaultEmailField    FieldRenderer
-	// DefaultPhoneField    FieldRenderer
-	// // DefaultTagsField     FieldRenderer
-	// DefaultCheckboxField FieldRenderer
-	// DefaultRadioField    FieldRenderer
-	// DefaultSelectField   FieldRenderer
+	hound.Model     `bson:",inline"`
+	fieldConfig     map[string]*FieldConfig `json:"-" bson:"-"`
+	fieldComponents map[string]Component    `json:"-" bson:"-"`
 }
+type FieldConfig struct {
+	name      string
+	label     string
+	component Component
+	formatter Formatter
+}
+
+// type FieldBuilder struct {
+// 	config *FieldConfig
+// }
 
 func NewModel(collectionName string, id ...string) Model {
 	return Model{
 		Model: hound.NewModel(collectionName, id...),
-		fieldRenderers: map[string]FieldRenderer{
-			"TextField":     defaultTextField,
-			"TextareaField": defaultTextareaField,
-			"NumberField":   defaultNumberField,
-			"EmailField":    defaultEmailField,
-			"PhoneField":    defaultPhoneField,
-			// "TagsField":     defaultTagsField,
-			"CheckboxField": defaultCheckboxField,
-			"RadioField":    defaultRadioField,
-			"SelectField":   defaultSelectField,
+		fieldConfig: map[string]*FieldConfig{
+			"Model": {component: HiddenIdField},
+		},
+		fieldComponents: map[string]Component{
+			TextFieldType.String():     TextField,
+			HiddenFieldType.String():   HiddenField,
+			IdFieldType.String():       HiddenIdField,
+			TextareaFieldType.String(): TextareaField,
+			NumberFieldType.String():   NumberField,
+			EmailFieldType.String():    EmailField,
+			PhoneFieldType.String():    PhoneField,
+			// TagsFieldType.String():     defaultTagsField,
+			CheckboxFieldType.String(): CheckboxField,
+			RadioFieldType.String():    RadioField,
+			SelectFieldType.String():   SelectField,
 		},
 	}
 }
@@ -59,161 +84,187 @@ func NewModel(collectionName string, id ...string) Model {
 //  2. Provide a tag to specify what type of field you want.
 //  3. Have a custom render method on the value type
 
-type FieldRenderer func(name, label, value string) *bolt.Field
+type Component func(name, label, value string) *bolt.Field
+type Formatter func(value reflect.Value) string
 
-func (m *Model) SetRenderer(name string, renderer FieldRenderer) {
-	m.fieldRenderers[name] = renderer
+func (m *Model) UseComponent(fieldType string, component Component) {
+	m.fieldComponents[fieldType] = component
 }
-func (m *Model) GetRenderer(name string) FieldRenderer {
-	return m.fieldRenderers[name]
+func (m *Model) FieldConfig(name string) *FieldConfig {
+	config := &FieldConfig{}
+	m.fieldConfig[name] = config
+	return config
 }
-func (m *Model) RenderField(name string, obj any) *bolt.Field {
-	object := reflect.ValueOf(obj)
-	if object.Kind() == reflect.Pointer {
-		object = object.Elem()
+func (c *FieldConfig) Name(name string) {
+	c.name = name
+}
+func (c *FieldConfig) Label(label string) {
+	c.label = label
+}
+func (c *FieldConfig) Component(component Component) {
+	c.component = component
+}
+func (c *FieldConfig) Formatter(formatter Formatter) {
+	c.formatter = formatter
+}
+
+func (m *Model) fieldRenderer(meta reflect.StructField) Component {
+	// Check if there's a renderer specified for the field by name
+
+	if config, ok := m.fieldConfig[meta.Name]; ok {
+		return config.component
 	}
-	value := object.FieldByName(name)
-	if value.IsValid() {
-		renderer := m.fieldRenderers[name]
-		if renderer != nil {
-			return renderer(name, name, value.String())
+
+	// log.Println(`meta.Tag.Get("element"): `, meta.Tag.Get("element"))
+	if tagEl := meta.Tag.Get("element"); tagEl != "" {
+		if el, ok := m.fieldComponents[tagEl]; ok {
+			return el
 		}
 	}
-	log.Printf("Field with name %s not found\n", name)
+	if elName := getElementFromDataType(meta.Type.String()); elName != "" {
+		if el, ok := m.fieldComponents[elName.String()]; ok {
+			return el
+		}
+	}
+	return m.fieldComponents[TextFieldType.String()]
+}
+func blankField() *bolt.Field {
 	return &bolt.Field{DefaultElement: bolt.NewDefaultElement("")}
 }
-func (m *Model) getRendererFromObject(object reflect.Value, field reflect.StructField) (FieldRenderer, bool) {
-	customRenderMethodName := fmt.Sprintf("Render%sField", field.Name)
-	customRenderMethod := object.MethodByName(customRenderMethodName)
-	if customRenderMethod.IsValid() {
-		if renderer, ok := customRenderMethod.Interface().(FieldRenderer); ok {
-			// log.Printf("Rendering %s of type %s using %s", field.Name, field.Type, customRenderMethodName)
-			return renderer, true
-		}
+func getReflectTypeAndValue(obj any) (reflect.Type, reflect.Value) {
+	objType := reflect.TypeOf(obj)
+	objValue := reflect.ValueOf(obj)
+	// Dereference if pointer
+	if objType.Kind() == reflect.Pointer {
+		objType = objType.Elem()
+		objValue = objValue.Elem()
 	}
-	return nil, false
+	return objType, objValue
+}
+func (m *Model) Field(name string, obj any) *bolt.Field {
+	objType, objValue := getReflectTypeAndValue(obj)
+	// Get the struct field by name (on the TYPE, not the value)
+	meta, ok := objType.FieldByName(name)
+	if !ok {
+		log.Printf("Field with name %s not found\n", name)
+		return blankField()
+	}
+	// Get the value
+	value := objValue.FieldByName(name)
+	if !value.IsValid() {
+		return blankField()
+	}
+	// Determine renderer based on type
+	return m.fieldRenderer(meta)(m.getName(meta), m.getLabel(meta), value.String())
+
+	// log.Printf("Field with name %s not found\n", name)
+	// return &bolt.Field{DefaultElement: bolt.NewDefaultElement("")}
 }
 
-// func (m *Model) getRendererFromTag(field reflect.StructField) (FieldRenderer, bool) {
-// 	if tag := field.Tag.Get("bolt"); tag != "" {
-// 		switch tag {
-// 		case string(TextFieldType):
-// 			return m.DefaultTextField, true
-// 		case string(CheckboxFieldType):
-// 			return m.DefaultCheckboxField, true
-// 		case string(NumberFieldType):
-// 			return m.DefaultNumberField, true
-// 		case string(EmailFieldType):
-// 			return m.DefaultEmailField, true
-// 		case string(PhoneFieldType):
-// 			return m.DefaultPhoneField, true
-// 		// case string(TagsFieldType):
-// 		// 	return m.DefaultTagsField, true
-// 		case string(RadioFieldType):
-// 			return m.DefaultRadioField, true
-// 		case string(TextareaFieldType):
-// 			return m.DefaultTextareaField, true
-// 		case string(SelectFieldType):
-// 			return m.DefaultSelectField, true
-// 		}
-// 	}
-// 	return nil, false
-// }
-
-// func (m *Model) getRendererFromField(value reflect.Value) (FieldRenderer, bool) {
-// 	if value.Kind() == reflect.Struct && value.CanAddr() {
-// 		method := value.Addr().MethodByName("Render")
-// 		// log.Println(`method.IsValid(): `, method.IsValid())
-// 		if method.IsValid() {
-// 			fieldRendererType := reflect.TypeFor[FieldRenderer]()
-// 			if method.Type().ConvertibleTo(fieldRendererType) {
-// 				renderer := method.Convert(fieldRendererType).Interface().(FieldRenderer)
-// 				return renderer, true
-// 			}
-// 		}
-// 	}
-// 	return nil, false
-// }
-// func (m *Model) getIdField(field reflect.StructField) (FieldRenderer, bool) {
-// 	if field.Name != "Model" {
-// 		return nil, false
-// 	}
-// 	return defaultIdField, true
-// }
-// func (m *Model) getFieldRenderer(object reflect.Value, field reflect.StructField, value reflect.Value) FieldRenderer {
-// 	renderer, ok := m.getIdField(field)
-// 	if ok {
-// 		return renderer
-// 	}
-// 	renderer, ok = m.getRendererFromObject(object, field)
-// 	if ok {
-// 		return renderer
-// 	}
-// 	renderer, ok = m.getRendererFromTag(field)
-// 	if ok {
-// 		return renderer
-// 	}
-// 	renderer, ok = m.getRendererFromField(value)
-// 	if ok {
-// 		return renderer
-// 	}
-
-//		return m.DefaultTextField
-//	}
-// func (m *Model) Form(s any) bolt.Element {
-// 	structType := reflect.TypeOf(s)
-// 	object := reflect.ValueOf(s)
-
-// 	// Ensure we are working with a struct
-// 	if structType.Kind() == reflect.Pointer {
-// 		structType = structType.Elem()
-// 		object = object.Elem()
-// 	}
-// 	log.Printf("This object has %d fields to render. ", structType.NumField())
-// 	form := bolt.Form()
-// 	for i := 0; i < structType.NumField(); i++ {
-
-//			field := structType.Field(i)
-//			value := object.Field(i)
-//			log.Printf(`Rendering %s of type %s`, field.Name, field.Type)
-//			// Skip unexported fields (reflection can't access them)
-//			if !field.IsExported() {
-//				continue
-//			}
-//			renderer := m.getFieldRenderer(object, field, value)
-//			form.Add(renderer(field.Name, field.Name, value.String()))
-//		}
-//		return form
-//	}
-func defaultIdField(name, label, value string) *bolt.Field {
-	// NewElement("input").Value(value).Type("hidden").Name(name)
-	return bolt.NewField("Id", "", value, "hidden")
-	// nullElement := bolt.None()
-	// bil
-	// return &bolt.Field{
-	// 	Label: nullElement,
-	// Input: bolt.HiddenInput(name, value),
-	// 	Error: nullElement,
-	// 	Check: nullElement,
-	// }
+func (m *Model) getLabel(meta reflect.StructField) string {
+	config, ok := m.fieldConfig[meta.Name]
+	if ok {
+		return config.label
+	}
+	label := meta.Tag.Get("label")
+	if label != "" {
+		return label
+	}
+	return meta.Name
 }
-func defaultTextField(name, label, value string) *bolt.Field {
+
+func (m *Model) getName(meta reflect.StructField) string {
+	config, ok := m.fieldConfig[meta.Name]
+	if ok {
+		return config.name
+	}
+	name := meta.Tag.Get("name")
+	if name != "" {
+		return name
+	}
+	return meta.Name
+}
+func getElementFromDataType(datatype string) FieldTypes {
+	switch datatype {
+	case "string":
+		return TextFieldType
+	case "int":
+		return NumberFieldType
+	case "int32":
+		return NumberFieldType
+	case "int64":
+		return NumberFieldType
+	case "bool":
+		return CheckboxFieldType
+	default:
+		return TextFieldType
+	}
+}
+func (m *Model) Form(s any) bolt.Element {
+	structType := reflect.TypeOf(s)
+	object := reflect.ValueOf(s)
+
+	// Ensure we are working with a struct
+	if structType.Kind() == reflect.Pointer {
+		structType = structType.Elem()
+		object = object.Elem()
+	}
+	log.Printf("This object has %d fields to render. ", structType.NumField())
+	form := bolt.Form()
+	for i := 0; i < structType.NumField(); i++ {
+
+		meta := structType.Field(i)
+		value := object.Field(i)
+
+		// Skip unexported fields (reflection can't access them)
+		if !meta.IsExported() {
+			log.Printf(`Skipping %s of type %s becuase it is not exported and reflection can't access it`, meta.Name, meta.Type)
+			continue
+		}
+		log.Printf(`Rendering %s of type %s`, meta.Name, meta.Type)
+		label := m.getLabel(meta)
+		name := m.getName(meta)
+		form.Add(m.fieldRenderer(meta)(name, label, value.String()))
+	}
+	return form
+}
+
+func HiddenField(name, label, value string) *bolt.Field {
+	log.Println("Rendering HiddenField with label", label)
+	inputEl := bolt.HiddenInput(name, value)
+	field := &bolt.Field{
+		DefaultElement: bolt.NewDefaultElement(""),
+		Input:          inputEl,
+	}
+	field.Children(inputEl)
+	return field
+}
+func HiddenIdField(name, label, value string) *bolt.Field {
+	log.Println("Rendering IdField with label", label)
+	return HiddenField("Id", "", value)
+}
+func TextField(name, label, value string) *bolt.Field {
+	log.Println("Rendering TextField with label", label)
 	return bolt.TextField(name, label, value)
 }
-func defaultTextareaField(name, label, value string) *bolt.Field {
+func TextareaField(name, label, value string) *bolt.Field {
+	log.Println("Rendering TextareaField with label", label)
 	return bolt.Textarea(name, label, value)
 }
-func defaultNumberField(name, label, value string) *bolt.Field {
+func NumberField(name, label, value string) *bolt.Field {
+	log.Println("Rendering NumberField with label", label)
 	input := bolt.TextField(name, label, value)
 	input.Type("number")
 	return input
 }
-func defaultEmailField(name, label, value string) *bolt.Field {
+func EmailField(name, label, value string) *bolt.Field {
+	log.Println("Rendering EmailField with label", label)
 	input := bolt.TextField(name, label, value)
 	input.Type("email")
 	return input
 }
-func defaultPhoneField(name, label, value string) *bolt.Field {
+func PhoneField(name, label, value string) *bolt.Field {
+	log.Println("Rendering PhoneField with label", label)
 	input := bolt.TextField(name, label, value)
 	input.Type("phone")
 	return input
@@ -222,13 +273,16 @@ func defaultPhoneField(name, label, value string) *bolt.Field {
 // func defaultTagsField(name, label, value string) *bolt.Field {
 
 // }
-func defaultCheckboxField(name, label, value string) *bolt.Field {
+func CheckboxField(name, label, value string) *bolt.Field {
+	log.Println("Rendering CheckboxField with label", label)
 	return bolt.Checkbox(name, label, value)
 }
-func defaultRadioField(name, label, value string) *bolt.Field {
+func RadioField(name, label, value string) *bolt.Field {
+	log.Println("Rendering RadioField with label", label)
 	return bolt.Radio(name, label, value)
 }
-func defaultSelectField(name, label, value string) *bolt.Field {
+func SelectField(name, label, value string) *bolt.Field {
+	log.Println("Rendering SelectField with label", label)
 	return bolt.Select(name, label, value, []bolt.Option{
 		{Label: "Male", Value: "male"},
 		{Label: "Female", Value: "female"},
@@ -242,136 +296,3 @@ func (m *Model) Element(name ...string) bolt.Element {
 	}
 	return bolt.HiddenInput(nameFormat, m.Id).Attr("special", "ed")
 }
-
-// type FieldRenderer func(name ...string) bolt.Element
-
-//	func Element(field reflect.StructField, value reflect.Value) bolt.Element {
-//		switch field.Type.Kind() {
-//		case reflect.Bool:
-//			return atoms.Checkbox(field.Name, field.Name, value.Bool(), field.Name, "")
-//		case reflect.Int:
-//			return atoms.TextField(field.Name, field.Name, value.String()).Attr("type", "number")
-//		default:
-//			return atoms.TextField(field.Name, field.Name, value.String())
-//		}
-//	}
-// func RenderForm(s any) bolt.Element {
-// 	structType := reflect.TypeOf(s)
-// 	structValue := reflect.ValueOf(s)
-
-// 	// Ensure we are working with a struct
-// 	if structType.Kind() == reflect.Pointer {
-// 		structType = structType.Elem()
-// 		structValue = structValue.Elem()
-// 	}
-
-// 	form := bolt.Form()
-// 	for i := 0; i < structType.NumField(); i++ {
-// 		field := structType.Field(i)
-// 		value := structValue.Field(i)
-
-// 		// Skip unexported fields (reflection can't access them)
-// 		if !field.IsExported() {
-// 			continue
-// 		}
-// 		log.Println(`field.Name: `, field.Name)
-// 		log.Println(`field.Type: `, field.Type)
-// 		log.Printf(`value: %v\n`, value)
-// 		customRenderMethodName := fmt.Sprintf("Render%sField", field.Name)
-// 		customRenderMethod := structValue.MethodByName(customRenderMethodName)
-// 		if customRenderMethod.IsValid() {
-// 			// The method exists; you can now call it
-// 			// log.Printf(`%s found\n`, customRenderMethodName)
-// 			if renderer, ok := customRenderMethod.Interface().(FieldRenderer); ok {
-// 				// Use the custom renderer
-// 				log.Printf("Rendering %s of type %s using %s", field.Name, field.Type, customRenderMethodName)
-// 				form.Add(renderer(field.Name, value.String()))
-// 				// form.Add(renderer.Element(field, value))
-// 				continue
-// 			} else {
-// 				log.Printf("%s doesn't implement FieldRenderer", customRenderMethodName)
-// 			}
-// 		}
-
-// 		// Extract custom info from struct tags
-// 		if tag := field.Tag.Get("bolt"); tag != "" {
-// 			log.Printf(`found a bolt tag: %s\n`, tag)
-// 			// (Simplified parsing logic for the example)
-// 			if tag == "email" {
-// 				form.Add(atoms.TextField(field.Name, field.Name, value.String())).Attr("type", "email")
-// 				continue
-// 			}
-// 			// switch tag {
-// 			// case "email":
-// 			// 	form.Add(atoms.TextField())
-
-// 			// }
-// 		}
-// 		log.Println(`field.Type.String(): `, field.Type.String())
-// 		// if field.Name == "Model" {
-// 		// 	log.Println("On Id field")
-// 		// 	if value.Kind() == reflect.Struct && value.CanAddr() {
-// 		// 		if modelPtr, ok := value.Addr().Interface().(*hound.Model); ok {
-// 		// 			// success
-// 		// 			log.Println("SUCCESS")
-// 		// 			form.Add(bolt.HiddenInput("Id", modelPtr.Id))
-// 		// 			continue
-// 		// 		} else {
-// 		// 			log.Println(`ok: `, ok)
-// 		// 		}
-// 		// 	} else {
-// 		// 		log.Println(`value.Kind() == reflect.Struct: `, value.Kind() == reflect.Struct)
-// 		// 		log.Println(`value.CanAddr(): `, value.CanAddr())
-// 		// 	}
-// 		// 	log.Println("#########PASSED ############")
-// 		// }
-// 		// if value.Kind() == reflect.Struct && value.CanAddr() {
-// 		// 	if modelPtr, ok := value.Addr().Interface().(*hound.Model); ok {
-// 		// 		form.Add(modelPtr.Element(field, value))
-// 		// 	}
-// 		// }
-// 		// log.Println(`value.Kind() == reflect.Struct: `, value.Kind() == reflect.Struct)
-// 		// log.Println(`value.CanAddr(): `, value.CanAddr())
-// 		if value.Kind() == reflect.Struct && value.CanAddr() {
-// 			method := value.Addr().MethodByName("Element")
-// 			log.Println(`method.IsValid(): `, method.IsValid())
-// 			if method.IsValid() {
-// 				fieldRendererType := reflect.TypeFor[FieldRenderer]()
-// 				if method.Type().ConvertibleTo(fieldRendererType) {
-// 					renderer := method.Convert(fieldRendererType).Interface().(FieldRenderer)
-// 					form.Add(renderer(field.Name, value.String()))
-// 					continue
-// 				}
-// 			}
-// 		}
-// 		// if value.Kind() == reflect.Struct && value.CanAddr() {
-// 		// 	renderFieldMethod := value.Addr().MethodByName("Element")
-// 		// 	if renderFieldMethod.IsValid() {
-// 		// 		// you found *hound.Model.Element
-// 		// 		form.Add(Element(field, value))
-// 		// 		continue
-// 		// 	}
-// 		// }
-// 		// 	renderFieldMethod := value.MethodByName("Element")
-// 		// 	log.Println(`renderFieldMethod: `, renderFieldMethod)
-// 		// 	if renderFieldMethod.IsValid() {
-// 		// 		log.Println(`renderFieldMethod.IsValid`)
-// 		// 		if renderer, ok := renderFieldMethod.Interface().(FieldRenderer); ok {
-// 		// 			// Use the custom renderer
-// 		// 			form.Add(renderer(field, value))
-// 		// 			// form.Add(renderer.Element(field, value))
-// 		// 			continue
-// 		// 		} else {
-// 		// 			log.Printf("%s doesn't implement FieldRenderer", customRenderMethodName)
-// 		// 		}
-// 		// 	} else {
-// 		// 		log.Println(`renderFieldMethod Is Not Valid`)
-// 		// 	}
-
-// 		form.Add(Element(field, value))
-
-// 		// 	// fmt.Fprintf(&html, "<label>%s</label><input type='%s' name='%s' value='%v'><br>\n",
-// 		// 	// 	label, inputType, field.Name, v.Field(i).Interface())
-// 	}
-// 	return form
-// }
