@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/jaredtmartin/bolt-go"
-	forms "github.com/jaredtmartin/musketforms"
+	"github.com/jaredtmartin/forms"
 
 	"github.com/stretchr/testify/assert"
 )

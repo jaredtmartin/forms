@@ -1,4 +1,4 @@
-module github.com/jaredtmartin/musket-forms
+module github.com/jaredtmartin/forms
 
 go 1.25.0
 
