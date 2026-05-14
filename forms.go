@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"strings"
 
 	"github.com/jaredtmartin/bolt-go"
 	"github.com/jaredtmartin/hound"
@@ -45,6 +46,7 @@ type Model struct {
 	hound.Model     `bson:",inline"`
 	fieldConfig     map[string]*FieldConfig `json:"-" bson:"-"`
 	fieldComponents map[string]Component    `json:"-" bson:"-"`
+	formatters      map[string]Formatter    `json:"-" bson:"-"`
 }
 type FieldConfig struct {
 	name      string
@@ -62,6 +64,12 @@ func NewModel(collectionName string, id ...string) Model {
 		Model: hound.NewModel(collectionName, id...),
 		fieldConfig: map[string]*FieldConfig{
 			"Model": {component: HiddenIdField},
+		},
+		formatters: map[string]Formatter{
+			"int":   IntFormatter,
+			"int32": IntFormatter,
+			"int64": IntFormatter,
+			"bool":  BoolFormatter,
 		},
 		fieldComponents: map[string]Component{
 			TextFieldType.String():     TextField,
@@ -108,11 +116,13 @@ func (c *FieldConfig) Formatter(formatter Formatter) {
 	c.formatter = formatter
 }
 
-func (m *Model) fieldRenderer(meta reflect.StructField) Component {
+func (m *Model) getComponent(meta reflect.StructField) Component {
 	// Check if there's a renderer specified for the field by name
 
 	if config, ok := m.fieldConfig[meta.Name]; ok {
-		return config.component
+		if config.component != nil {
+			return config.component
+		}
 	}
 
 	// log.Println(`meta.Tag.Get("element"): `, meta.Tag.Get("element"))
@@ -141,6 +151,14 @@ func getReflectTypeAndValue(obj any) (reflect.Type, reflect.Value) {
 	}
 	return objType, objValue
 }
+func (m *Model) renderField(meta reflect.StructField, value reflect.Value, prefix ...string) *bolt.Field {
+	namePrefix := ""
+	if len(prefix) > 0 {
+		namePrefix = prefix[0]
+	}
+	component := m.getComponent(meta)
+	return component(namePrefix+m.getName(meta), m.getLabel(meta), m.getValue(meta, value))
+}
 func (m *Model) Field(name string, obj any) *bolt.Field {
 	objType, objValue := getReflectTypeAndValue(obj)
 	// Get the struct field by name (on the TYPE, not the value)
@@ -154,13 +172,27 @@ func (m *Model) Field(name string, obj any) *bolt.Field {
 	if !value.IsValid() {
 		return blankField()
 	}
-	// Determine renderer based on type
-	return m.fieldRenderer(meta)(m.getName(meta), m.getLabel(meta), value.String())
-
+	return m.renderField(meta, value)
 	// log.Printf("Field with name %s not found\n", name)
 	// return &bolt.Field{DefaultElement: bolt.NewDefaultElement("")}
 }
-
+func (m *Model) getFormatter(meta reflect.StructField) Formatter {
+	if config, ok := m.fieldConfig[meta.Name]; ok && config.formatter != nil {
+		return config.formatter
+	}
+	format := meta.Tag.Get("format")
+	if format != "" {
+		if formatter, ok := m.formatters[format]; ok {
+			return formatter
+		}
+	}
+	return StringFormatter
+}
+func (m *Model) getValue(meta reflect.StructField, value reflect.Value) string {
+	formatter := m.getFormatter(meta)
+	log.Println(`formatter: `, formatter)
+	return formatter(value)
+}
 func (m *Model) getLabel(meta reflect.StructField) string {
 	config, ok := m.fieldConfig[meta.Name]
 	if ok {
@@ -200,21 +232,14 @@ func getElementFromDataType(datatype string) FieldTypes {
 		return TextFieldType
 	}
 }
-func (m *Model) Form(s any) bolt.Element {
-	structType := reflect.TypeOf(s)
-	object := reflect.ValueOf(s)
-
-	// Ensure we are working with a struct
-	if structType.Kind() == reflect.Pointer {
-		structType = structType.Elem()
-		object = object.Elem()
-	}
-	log.Printf("This object has %d fields to render. ", structType.NumField())
+func (m *Model) Form(s any, prefix ...string) bolt.Element {
+	objType, objValue := getReflectTypeAndValue(s)
+	log.Printf("This object has %d fields to render. ", objType.NumField())
 	form := bolt.Form()
-	for i := 0; i < structType.NumField(); i++ {
+	for i := 0; i < objType.NumField(); i++ {
 
-		meta := structType.Field(i)
-		value := object.Field(i)
+		meta := objType.Field(i)
+		value := objValue.Field(i)
 
 		// Skip unexported fields (reflection can't access them)
 		if !meta.IsExported() {
@@ -222,9 +247,7 @@ func (m *Model) Form(s any) bolt.Element {
 			continue
 		}
 		log.Printf(`Rendering %s of type %s`, meta.Name, meta.Type)
-		label := m.getLabel(meta)
-		name := m.getName(meta)
-		form.Add(m.fieldRenderer(meta)(name, label, value.String()))
+		form.Add(m.renderField(meta, value, prefix...))
 	}
 	return form
 }
@@ -287,6 +310,32 @@ func SelectField(name, label, value string) *bolt.Field {
 		{Label: "Male", Value: "male"},
 		{Label: "Female", Value: "female"},
 	})
+}
+func StringFormatter(v reflect.Value) string {
+	return fmt.Sprint(v.String())
+}
+func IntFormatter(v reflect.Value) string {
+	return fmt.Sprint(v.Int())
+}
+func BoolFormatter(v reflect.Value) string {
+	if v.Bool() {
+		return "true"
+	}
+	return ""
+}
+func IdFormatter(v reflect.Value) string {
+	if modelStruct, ok := v.Interface().(Model); ok {
+		// fmt.Println("ID via assertion:", modelStruct.Id)
+		return modelStruct.Id
+	}
+	log.Println("Unable to ")
+	return ""
+}
+func StringSliceFormatter(v reflect.Value) string {
+	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.String {
+		return strings.Join(v.Interface().([]string), ",")
+	}
+	return fmt.Sprint(v.Interface())
 }
 
 func (m *Model) Element(name ...string) bolt.Element {
