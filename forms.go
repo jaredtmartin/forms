@@ -157,6 +157,9 @@ func (m *Model) renderField(meta reflect.StructField, value reflect.Value, prefi
 		namePrefix = prefix[0]
 	}
 	component := m.getComponent(meta)
+	if component == nil {
+		log.Println(`getComponent returned no component!`)
+	}
 	return component(namePrefix+m.getName(meta), m.getLabel(meta), m.getValue(meta, value))
 }
 func (m *Model) Field(name string, obj any) *bolt.Field {
